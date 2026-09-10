@@ -2,6 +2,8 @@
 
 > *Qwen3.8-Flash-Next (180B MoE) on one RTX 6000 Pro (96GB) + 64GB system RAM — 1.11M-token KV pool, 1M context, native NVFP4 MTP.*
 >
+> **单卡服役实录**：96G 显存 + 62G 内存，SSD-Stream 双通 PLE，768K 长文实测过闸，全数字带日志出处。
+>
 > **[完整中文账本 → README.zh-CN.md](README.zh-CN.md)** (full Chinese write-up — every number traceable to verbatim logs)
 
 A two-day engineering campaign (Sep 7 → Sep 9, 2026) growing the KV pool **374,208 → 1,111,168 tokens (×2.97)** on a single RTX 6000 Pro 96GB with only ~62GB usable host RAM. All numbers come from archived logs; nothing is extrapolated.
