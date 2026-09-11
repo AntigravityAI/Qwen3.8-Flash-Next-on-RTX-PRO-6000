@@ -24,8 +24,9 @@
 - [8. 坑清单：现象 → 根因 → 修法](#section-8)
 - [9. 方法论：让下一轮从账本继续](#section-9)
 - [10. 复现指南：最终原生 NVFP4 路线](#section-10)
-- [11. 现役配置快照与未完成项](#section-11)
-- [12. 发布前检查清单](#section-12)
+- [11. 池的边界模型：fraction 退化为护栏（09-10/09-11 续测）](#section-boundary)
+- [12. 现役配置快照与未完成项](#section-11)
+- [13. 发布前检查清单](#section-12)
 - [附录 A：补丁 diff 与适用范围](#appendix-a)
 - [附录 B：日志与报告索引](#appendix-b)
 - [附录 C：关键数字抽查记录](#appendix-c)
@@ -815,9 +816,70 @@ TARGET_OVERRIDES='{"text_config":{"rope_parameters":{"mrope_interleaved":true,"m
 
 ---
 
+<a id="section-boundary"></a>
+
+## 11. 池的边界模型：fraction 退化为护栏（09-10/09-11 续测）
+
+> 前九级点火解决“怎么把池做大”；本节解决“池该停在哪、余量该给谁”。全部数字来自 docker 化现役栈（`sglang-qwen3.8-flash`）的真实重启轮，预测先行、实测在后。
+
+### 11.1 引信：0.992 下的视觉请求崩循环
+
+现役 0.992 时一张 2560² 画板图进入 transformers 图像预处理，瞬时分配失败反复 500，最终拖崩 scheduler 主循环 → SGLang 自 shutdown（SIGQUIT → 等 60s coredump → `kill_process_tree` → **exit 0**）→ `restart: unless-stopped` 自动重启循环。取证口径：`docker inspect --format '{{.RestartCount}} {{.State.StartedAt}}'` + `docker events`——**exit 0 紧跟 start 是应用自杀，不是人为重启、也不是容器 OOM-kill**；根因看超时块之前最后一条非噪音异常，不在超时行本身。
+
+### 11.2 边界公式
+
+`池 = min(token锁, (95.59 GiB × fraction − 固定开销) ÷ 单token KV)`
+
+固定开销 = 权重 75.60 GiB + CUDA graphs/杂项 1.46 GiB，另有 ~1.9 GiB 池外占用者（驱动 context、mm worker）——反推空闲必须减掉。单 token 实测 13.05 GiB ↔ 1,111,168（≈12 KB，fp8 KV + Mamba/GDN 态）。
+
+### 11.3 fraction 扫描：锁存在时它是护栏不是旋钮
+
+| fraction | 池 (GiB) | 池 (tokens) | 启动动态空闲 | 结果 |
+|---|---:|---:|---:|---|
+| 0.992（事故态） | 13.05 | 1,111,168 | ≈0（理论 ~1.9，graphs 后归零） | ❌ 大图即崩 |
+| 0.98（现役基线） | 13.05 | 1,111,168 | 3.57 GiB | ✅ |
+| 0.97 / 0.96 | 13.05 | 1,111,168 | 3.57 GiB（与 0.98 完全等价，各实测一轮） | ✅ 无增益 |
+| 0.943 | 13.05 | 1,111,168 | ~0 | 临界擦线 |
+| 0.94 | 12.80 | 1,089,643 | — | 池开始等比缩水 |
+| 0.93 | 11.84 | 1,008,249 | — | −10 万 token |
+
+显式 `--max-total-tokens` 压过 fraction 的自动推导后，**池只认锁，fraction 只在跌破 ~0.943 后才开始削池**。事故修复（0.992→0.98）的实质是恢复动态余量到 3.57 GiB 而池分文未动；继续往下降 fraction 换不来余量。基线定 **0.98**：高于临界点、给 PLE LUT / hicache 元数据 / Mamba buffer 留够 SGLang 自身预留。
+
+### 11.4 锁扫描：提锁 1:1.3 GiB/10万token，「第一张能过」不是验收
+
+fraction 0.98 定值：
+
+| 锁 | 池 (GiB) | 启动空闲 | 大图前空闲 | 结果 |
+|---|---:|---:|---:|---|
+| **1,111,168（现役）** | 13.05 | 3.57 | 2.62 | ✅ 连打 7 张全过（含 2796×2002、2.2 MB），图后钉住 909 MiB |
+| 1,170,006 | 14.12 | 2.81 | 1.86 | ⚠️ 第 1 张过但图后仅剩 **131 MiB**，第 2 张（不同宽高比）500 |
+| 1,211,168 | 14.22 | 2.27 | 1.32 | ❌ 第 1 张即 500 + scheduler 自杀重启 |
+| 1,311,168 | 15.39 | 1.24 | — | 贴图必炸 |
+| 1,572,864 / 2,097,152 | 18.47 / 24.62 | −1.83 / −7.99 | — | 起不来 |
+
+- 边际成本由两组实测点反推：**每 +10 万 token = −1.30 GiB 空闲**（≈13 KB/tok，含池内 Mamba/GDN 缓冲，比纯 KV 口径略陡），启动/运行两口径一致。
+- **多图可用的真实判据是「图后剩余 ≥ ~0.8 GB」**——第一张图的缓存高水位块不能被形状不同的第二张完全复用，所以 1,170,006 数学上单张通过也不算可用。现役 1,111,168 恰是这条线的上界。
+- 真实流量峰值仅占池 5%（~5.5 万 token）：提锁不服务日常，只服务「单条干满 1M 且并行还有长会话」，而那需要 +11.6 GiB 池，单卡物理不可行。
+- **摘锁是回退不是释放**：自动推导吃满 fraction 预算 → 动态余量塌到 ~0.5 GB → warmup CUDA OOM。锁必须保留。
+- 高水位不随请求释放（torch caching allocator 复用），只有重启回启动值——所以报余量必须「启动/运行」两口径分开。
+
+### 11.5 HiCache 的天花板是 host 内存不是显存
+
+宿主 62 GiB 三分账：PLE 表钉死 28 + hicache L2 + ~21（OS/worker/page-cache）。`--hicache-size 16` 在 pool 构建期直接 `ValueError: Not enough host memory available`——**13 GiB 封顶**（swap 已用 ~3 GB，host 侧本就偏紧）。L3 file 后端另挂 150 GiB SSD 目录（env 变量配路径，`--file-storage-path` 是另一个参数别混用），写策略必须 `write_through`（write_back 重启后命中率归零）。附一条容器坑：runtime 镜像缺 openssl 头会让 HiCache 的 native_hash JIT 编译崩在 scheduler 加载期，表象是 warmup 600s 超时重启循环——ro 挂宿主 `/usr/include/openssl` 与 `libcrypto.so` 即愈。
+
+### 11.6 大图的根治旋钮
+
+不是 fraction、不是锁，是 **`SGLANG_IMAGE_MAX_PIXELS`**（fork 内 `qwen_vl.py` 读取，编码前把尺寸夹到上限）。默认高，故 2560² 满配吃 ~1.8 GB 瞬时；压到 ~602112（≈777²）峰值降到几百 MB，代价细字发糊。本轮结论（作者拍板）：88 视觉在 0.98/1,111,168 下已能扛大图连打，识图模型引进线终止；密集小字画板改由本机 oMLX 的 Qwen3-VL-8B 承担（三方同图对比 11/12 > 8/12 > 7/12）。
+
+### 11.7 方法论补条
+
+扫任何旋钮前，先用 11.2 公式把「池 / 启动空闲 / 图前空闲」三个预测值写进记录再重启——本轮 fraction 两点、锁两点预测全命中，模型才继续可信；事后拟合的解释不算结论。响应事故的调参，必须重放原失败请求类才算修好（当年只测 /health 就报“修好了”，重放现形）。
+
+---
+
 <a id="section-11"></a>
 
-## 11. 现役配置快照与未完成项
+## 12. 现役配置快照与未完成项
 
 **唯一现役口径：`CURRENT-PRODUCTION.md`，2026-09-09 00:08定版。** 本节是这份归档的公开快照，不根据文件名猜配置，也不把写稿过程中后续实时流量纳入截止00:08的战果。
 
@@ -848,7 +910,7 @@ TARGET_OVERRIDES='{"text_config":{"rope_parameters":{"mrope_interleaved":true,"m
 
 <a id="section-12"></a>
 
-## 12. 发布前检查清单
+## 13. 发布前检查清单
 
 - [x] 终态采用00:08定版；头部、快照、复现参数一致。
 - [x] 早期九级与晚间九幕分开；失败、回退、统计黄灯和未验项明确。
@@ -1144,4 +1206,4 @@ TARGET_OVERRIDES='{"text_config":{"rope_parameters":{"mrope_interleaved":true,"m
 
 ---
 
-**作者：Eddy**（GitHub [@AntigravityAI](https://github.com/AntigravityAI)）· 完稿 2026-09-09 · 全部数字可由附录 B 日志索引复核
+**作者：Eddy**（GitHub [@AntigravityAI](https://github.com/AntigravityAI)）· 主战役完稿 2026-09-09，边界模型续测 2026-09-11 · 全部数字可由附录 B 日志索引复核

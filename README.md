@@ -6,7 +6,7 @@
 >
 > **[完整中文账本 → README.zh-CN.md](README.zh-CN.md)** (full Chinese write-up — every number traceable to verbatim logs)
 
-A two-day engineering campaign (Sep 7 → Sep 9, 2026) growing the KV pool **374,208 → 1,111,168 tokens (×2.97)** on a single RTX 6000 Pro 96GB with only ~62GB usable host RAM. All numbers come from archived logs; nothing is extrapolated.
+A two-day engineering campaign (Sep 7 → Sep 9, 2026) growing the KV pool **374,208 → 1,111,168 tokens (×2.97)** on a single RTX 6000 Pro 96GB with only ~62GB usable host RAM, plus a Sep 10–11 boundary-model round establishing **why that cap is the stop line** (see below). All numbers come from archived logs; nothing is extrapolated.
 
 ## TL;DR
 
@@ -57,6 +57,18 @@ One line of `gc.collect()` — breaking reference cycles left over from weight l
 - The pool cap must be page-aligned — the final 64 × 17,362 = 1,111,168 costs zero bytes
 - Warm up briefly before long inputs: lazy kernels/workspace aren't paid for at boot ("cold furnace" big-prefill crash)
 
+## The boundary model (Sep 10–11): where the pool should stop
+
+The nine-level campaign grew the pool; the follow-up round established **where it must stop**, on the dockerized production stack — every sweep point predicted from the boundary formula first, verified after restart.
+
+- **Formula**: `pool = min(cap, (95.59 GiB × mem-fraction − fixed overhead) ÷ ~12 KB/token)`; fixed overhead = 75.60 weights + 1.46 CUDA graphs + ~1.9 GiB out-of-pool residents.
+- **With an explicit `--max-total-tokens`, mem-fraction degrades from allocation knob to safety guardrail**: 0.99/0.98/0.97/0.96 measured identical (pool 1,111,168, startup headroom 3.57 GiB). It only bites below ~0.943, where the pool shrinks proportionally.
+- **Raising the cap costs 1.30 GiB headroom per +100 K tokens** (measured on two points, startup and runtime agree). At cap 1,170,006 the *first* big image passes but leaves 131 MiB and the *second* one (different aspect ratio) 500s — **single-image pass ≠ usable**; the acceptance test is post-image headroom ≥ ~0.8 GB. Current cap 1,111,168 sits exactly on that line and survived 7 images back-to-back (incl. 2796×2002).
+- **0.992 crash chain**: vision pre-transient failed → scheduler self-shutdown → `exit 0` → `restart: unless-stopped` loop. A clean exit-0 restart in docker events is application suicide, not a manual restart and not a container OOM-kill.
+- **HiCache ceiling is host RAM, not VRAM**: 62 GB = 28 pinned PLE + L2 + ~21 OS/workers; `--hicache-size 16` dies with `Not enough host memory` — 13 GiB is the cap. L3 (file backend, 150 GiB SSD) requires `write_through` or hit-rate reads back ~0 after restart.
+- **The real knob for big images is `SGLANG_IMAGE_MAX_PIXELS`**, not fraction or cap (clamps pre-encode; ~602 K pixels → few-hundred-MB transient).
+- Removing the cap is a regression, not a freeing: auto-derivation fills the whole fraction budget → ~0.5 GB slack → warmup OOM. Keep the cap pinned.
+
 ## Reproduce
 
 See the final production snapshot in [README.zh-CN.md §11](README.zh-CN.md) — launch flags, patch diffs (poolfix / estfix / gcfix / fp8mtp, Appendix A), and the log index (Appendix B) for every number above.
@@ -74,4 +86,4 @@ Without these upstream and community shoulders, none of this happens on a single
 
 ---
 
-**Author: Eddy** (GitHub [@AntigravityAI](https://github.com/AntigravityAI)) · completed 2026-09-09 · every number verifiable via Appendix B log index · **[中文完整版](README.zh-CN.md)**
+**Author: Eddy** (GitHub [@AntigravityAI](https://github.com/AntigravityAI)) · main campaign 2026-09-09, boundary model 2026-09-11 · every number verifiable via Appendix B log index · **[中文完整版](README.zh-CN.md)**
